@@ -13,6 +13,7 @@
 <meta property="og:image" content="https://reileigh-hub.github.io/bible-points/isaac.png">
 <meta name="twitter:card" content="summary">
 <title>Bible Points</title>
+<link rel="preconnect" href="https://abacus.jasoncameron.dev">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
 <style>
 :root{
@@ -141,9 +142,8 @@ h1{
 .plus.big{font-size:clamp(34px,6.6vh,62px)}
 .spark{position:fixed;z-index:4;pointer-events:none;width:var(--s);height:var(--s);margin:calc(var(--s)/-2) 0 0 calc(var(--s)/-2);background:var(--gold-hi);clip-path:polygon(50% 0,60% 40%,100% 50%,60% 60%,50% 100%,40% 60%,0 50%,40% 40%)}
 
-.reset{position:fixed;z-index:4;right:clamp(16px,2.6vmin,30px);bottom:clamp(14px,2.4vmin,28px);padding:8px 10px;border:0;background:none;font:13px/1 var(--serif);letter-spacing:.06em;color:#dcc99a;cursor:pointer;text-shadow:0 1px 2px #000}
-.reset:hover{color:var(--ivory);text-decoration:underline}
-.reset:focus-visible{outline:2px solid var(--ivory);outline-offset:2px;border-radius:3px}
+.net[hidden]{display:none}
+.net{position:fixed;z-index:4;left:50%;bottom:clamp(14px,2.4vmin,28px);translate:-50% 0;width:max-content;max-width:min(88vw,560px);padding:8px 14px;border-radius:6px;background:rgba(20,12,6,.9);font:13px/1.35 var(--serif);text-align:center;color:#f3e3b4}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.mote{display:none}}
@@ -232,27 +232,130 @@ h1{
   </div>
   <p class="hint">Press Isaac to add a point</p>
 </main>
-<button class="reset" id="reset" type="button" hidden>Reset</button>
+<p class="net" id="net" role="status" hidden>Can't reach the scoreboard, so this number may be behind. Your presses are saved and will count when it's back.</p>
 
 <script>
 (() => {
   'use strict';
-  const KEY = 'bible-points', MIN_WHEELS = 6, STEP = Math.PI / 5;
+  const MIN_WHEELS = 6, STEP = Math.PI / 5;
   const $ = id => document.getElementById(id);
   const strip = $('wheels'), isaac = $('isaac'), ring = $('ring'), rays = $('rays'),
-        counter = $('counter'), out = $('count'), resetBtn = $('reset'), bible = $('bible');
+        counter = $('counter'), out = $('count'), net = $('net'), bible = $('bible');
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const wheels = [];
   let height = 0, frame = 0, last = 0;
 
-  function load() {
+  /* The real score lives on the Abacus counter service, so everyone sees the same
+     number. This page shows that number plus this person's presses still on the way. */
+  const API = 'https://abacus.jasoncameron.dev';
+  const COUNTER = 'reileigh-hub-bible-points/total';
+  const UNSENT = 'bible-points-unsent', LAST_SEEN = 'bible-points-last-seen';
+  const SEND_GAP = 600;   /* the service allows 30 requests per 10 seconds per address,
+                             so friends on the same wifi need room to share it */
+  const CHECK_BUSY = 4000, CHECK_QUIET = 20000, QUIET_AFTER = 120000;
+  const stored = k => {
     try {
-      const n = parseInt(localStorage.getItem(KEY), 10);
+      const n = parseInt(localStorage.getItem(k), 10);
       return Number.isSafeInteger(n) && n > 0 ? n : 0;
     } catch (e) { return 0; }
+  };
+  const store = (k, v) => { try { localStorage.setItem(k, String(v)); } catch (e) {} };
+  const valid = v => Number.isSafeInteger(v) && v >= 0;
+  const pause = ms => new Promise(r => setTimeout(r, ms));
+  const request = path => fetch(API + path, {
+    cache: 'no-store',
+    keepalive: true,   /* a press on its way still lands if the page closes or reloads */
+    signal: window.AbortSignal && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined
+  });
+
+  let server = stored(LAST_SEEN);   /* last score the service told us */
+  let queued = stored(UNSENT);      /* presses not sent yet; kept so a closed tab loses nothing */
+  let inflight = 0;                 /* the press being sent right now */
+  let presses = 0;                  /* bumps whenever a press goes out, so an older read can be ignored */
+  let synced = false;               /* has the service answered since this page opened? */
+  let lastChange = Date.now();
+  let count = server + queued;
+
+  function setServer(v) {
+    if (v !== server) lastChange = Date.now();
+    server = v;
+    store(LAST_SEEN, v);
   }
-  function save() { try { localStorage.setItem(KEY, String(count)); } catch (e) {} }
-  let count = load();
+
+  /* Sends presses one at a time, slowly enough to stay inside the rate limit */
+  let sending = false, leaving = false;
+  async function pump() {
+    if (sending) return;
+    sending = true;
+    let backoff = 2000;
+    while (queued > 0) {
+      queued -= 1;
+      inflight = 1;
+      presses += 1;
+      store(UNSENT, queued);
+      let wait = SEND_GAP;
+      try {
+        const res = await request(`/hit/${COUNTER}`);
+        if (res.status === 429) { const e = new Error('slow down'); e.limited = true; throw e; }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const { value } = await res.json();
+        inflight = 0;
+        if (valid(value)) {
+          setServer(value);
+          synced = true;
+        }
+        net.hidden = true;
+        backoff = 2000;
+      } catch (err) {
+        inflight = 0;
+        /* The page closing cancels the wait for an answer, not the press: don't send it twice */
+        if (leaving) break;
+        queued += 1;
+        store(UNSENT, queued);
+        if (err.limited) {
+          wait = 10000;
+        } else {
+          net.hidden = false;
+          wait = backoff;
+          backoff = Math.min(backoff * 2, 30000);
+        }
+      }
+      render();
+      await pause(wait);
+    }
+    sending = false;
+  }
+
+  /* Reads the score, which is how other people's presses reach this page. Skipped while
+     sending, because each press's answer already carries the latest score. */
+  async function refresh() {
+    if (sending) return;
+    const started = presses;
+    try {
+      const res = await request(`/get/${COUNTER}`);
+      if (res.status === 429) return;
+      if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
+      const value = res.status === 404 ? 0 : (await res.json()).value;
+      if (!valid(value) || inflight || started !== presses) return;   /* out of date already */
+      const others = synced && queued === 0 ? value - server : 0;
+      setServer(value);
+      synced = true;
+      net.hidden = true;
+      render();
+      if (others > 0) somebodyElse(others);
+    } catch (err) {
+      net.hidden = false;
+    }
+  }
+
+  /* Checks often while points are coming in, and rarely on a page left open and idle */
+  async function watch() {
+    if (!document.hidden) {
+      await refresh();
+      pump();
+    }
+    setTimeout(watch, Date.now() - lastChange > QUIET_AFTER ? CHECK_QUIET : CHECK_BUSY);
+  }
 
   /* Odometer: each wheel is a drum of ten digits. A wheel's position only ever
      means "how many full digits it has turned", so 9 rolls forward into 0. */
@@ -321,12 +424,12 @@ h1{
     if (!frame) { last = performance.now(); frame = requestAnimationFrame(tick); }
   }
   function render() {
+    count = server + queued + inflight;
     fitWheels();
     roll();
     const label = count === 1 ? 'Bible Point' : 'Bible Points';
     out.textContent = `${count.toLocaleString()} ${label}`;
     document.title = count ? `${count.toLocaleString()} ${label}` : 'Bible Points';
-    resetBtn.hidden = count === 0;
   }
 
   /* Press effects */
@@ -363,6 +466,15 @@ h1{
       ], { duration: 650 + Math.random() * 400, easing: 'cubic-bezier(.15,.7,.3,1)' }).onfinish = () => s.remove();
     }
   }
+  function somebodyElse(n) {
+    if (reduce) return;
+    const c = counter.getBoundingClientRect();
+    floatText(c.left + c.width / 2, c.bottom, `+${n}`);
+    counter.animate([
+      { translate: '0 0' }, { translate: '0 3px', offset: 0.3 }, { translate: '0 0' }
+    ], { duration: 170 });
+  }
+
   /* Restart a press move cleanly, so fast presses always feel instant */
   function play(id, frames, ms) {
     const el = $(id);
@@ -434,29 +546,12 @@ h1{
   }
 
   isaac.addEventListener('click', e => {
-    count += 1;
-    save();
+    queued += 1;
+    lastChange = Date.now();
+    store(UNSENT, queued);
     render();
     celebrate(e);
-  });
-
-  /* Reset takes two presses so nobody wipes the score by accident */
-  let armed = 0;
-  function disarm() {
-    clearTimeout(armed);
-    armed = 0;
-    resetBtn.textContent = 'Reset';
-  }
-  resetBtn.addEventListener('click', () => {
-    if (!armed) {
-      resetBtn.textContent = 'Press again to reset to 0';
-      armed = setTimeout(disarm, 3000);
-      return;
-    }
-    disarm();
-    count = 0;
-    save();
-    render();
+    pump();
   });
 
   /* Drifting gold dust */
@@ -475,10 +570,15 @@ h1{
   }
 
   addEventListener('resize', measure);
-  addEventListener('storage', e => { if (e.key === KEY) { count = load(); render(); } });
+  addEventListener('storage', e => { if (e.key === UNSENT) { queued = stored(UNSENT); render(); } });
+  addEventListener('pagehide', () => { leaving = true; });
+  addEventListener('pageshow', () => { leaving = false; });
+  addEventListener('online', () => { refresh(); pump(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); pump(); } });
   fitWheels();
   measure();
   render();
+  watch();
 })();
 </script>
 </body>
